@@ -1,0 +1,13 @@
+[package]
+name = "opencadgraph"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Node graph engine for CAD: dataflow over object property ports"
+repository = "https://github.com/HakanSeven12/opencadgraph"
+keywords = ["cad", "node", "graph", "dataflow", "visual-programming"]
+categories = ["graphics"]
+
+[dependencies]
+serde_json = "1"
+kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "5e24ef7" }
