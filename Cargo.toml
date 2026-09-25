@@ -10,4 +10,4 @@ categories = ["graphics"]
 
 [dependencies]
 serde_json = "1"
-kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "5e24ef7" }
+kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "5d9e921" }
