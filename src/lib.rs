@@ -12,7 +12,7 @@ pub mod value;
 use std::collections::BTreeMap;
 
 use kernel::space::PlanarCurve;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub use ops::{spec, Spec, CATEGORIES, LIBRARY};
 
@@ -187,6 +187,67 @@ impl Graph {
             .and_then(|node| node.params.get(&port.field))
             .cloned()
             .unwrap_or(Value::Null)
+    }
+
+    /// The graph as JSON: each node's kind and parameters, and the links.
+    /// Outputs are not stored; they come back from the next evaluation.
+    pub fn to_json(&self) -> Value {
+        let port = |port: &Port| json!({ "node": port.node, "field": port.field });
+        json!({
+            "nodes": self.nodes.iter().map(|node| json!({
+                "id": node.id,
+                "kind": match &node.kind {
+                    Kind::Op(spec) => json!({ "op": spec.name }),
+                    Kind::Object(name) => json!({ "object": name }),
+                },
+                "params": node.params,
+            })).collect::<Vec<_>>(),
+            "links": self.links.iter().map(|link| json!({
+                "from": port(&link.from),
+                "to": port(&link.to),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Reads [`to_json`](Self::to_json) output. Inputs an operation has
+    /// gained since the file was written start at their defaults; links to
+    /// nodes that are not there are dropped.
+    pub fn from_json(value: &Value) -> Result<Self, String> {
+        let mut graph = Graph::default();
+        for node in value["nodes"].as_array().ok_or("missing nodes")? {
+            let id = node["id"]
+                .as_u64()
+                .and_then(|id| NodeId::try_from(id).ok())
+                .filter(|id| *id > 0 && graph.node(*id).is_none())
+                .ok_or("missing, zero or repeated node id")?;
+            let kind = if let Some(name) = node["kind"]["op"].as_str() {
+                Kind::Op(spec(name).ok_or_else(|| format!("unknown node `{name}`"))?)
+            } else if let Some(name) = node["kind"]["object"].as_str() {
+                Kind::Object(name.to_owned())
+            } else {
+                return Err(format!("node {id} has no kind"));
+            };
+            graph.next_id = id - 1;
+            graph.add(kind);
+            if let (Some(node), Some(params)) = (graph.nodes.last_mut(), node["params"].as_object()) {
+                node.params.extend(params.iter().map(|(name, value)| (name.clone(), value.clone())));
+            }
+            graph.next_id = graph.nodes.iter().map(|node| node.id).max().unwrap_or(0);
+        }
+        let port = |value: &Value| -> Option<Port> {
+            Some(Port {
+                node: NodeId::try_from(value["node"].as_u64()?).ok()?,
+                field: value["field"].as_str()?.to_owned(),
+            })
+        };
+        for link in value["links"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            if let (Some(from), Some(to)) = (port(&link["from"]), port(&link["to"])) {
+                if graph.node(from.node).is_some() && graph.node(to.node).is_some() {
+                    graph.connect(from, to);
+                }
+            }
+        }
+        Ok(graph)
     }
 
     /// Evaluates every node, upstream first.
