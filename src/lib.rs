@@ -1,40 +1,52 @@
-//! A node graph engine for CAD.
+//! A node graph engine.
 //!
-//! Nodes are either library operations ([`ops::LIBRARY`]) or host objects:
-//! drawing objects whose property rows are the ports. The engine owns the
-//! graph and the dataflow — ordering, list lacing, value coercion — and asks
-//! the [`Host`] to create, edit and read objects. It has no user interface
-//! and no document model of its own.
+//! Nodes are operations ([`Spec`]s: the built-in [`ops::LIBRARY`] plus any the
+//! application defines) or host objects whose property rows are the ports.
+//! The engine owns the graph and the dataflow — ordering, list lacing, value
+//! coercion — and asks the [`Host`] for everything application-specific. It
+//! has no user interface, no document model and no dependency on either; with
+//! the unit host `()` it evaluates the built-in library on its own.
 
+pub mod expr;
 pub mod ops;
 pub mod value;
 
 use std::collections::BTreeMap;
 
-use kernel::space::PlanarCurve;
 use serde_json::{json, Value};
 
-pub use ops::{spec, Spec, CATEGORIES, LIBRARY};
+pub use ops::{spec, Eval, Spec, CATEGORIES, LIBRARY};
 
 pub type NodeId = u32;
 
-/// What the graph needs from the application.
+/// What the graph needs from the application. Every method has a default, so
+/// an application implements only what it offers.
 pub trait Host {
     /// Makes node `node` own `instances.len()` objects of `kind`, writes each
-    /// instance's linked fields, and returns every instance's readable fields.
+    /// instance's fields, and returns every instance's readable fields.
     fn objects(
         &mut self,
-        node: NodeId,
-        kind: &str,
-        instances: &[Vec<(String, Value)>],
-    ) -> Vec<Vec<(String, Value)>>;
+        _node: NodeId,
+        _kind: &str,
+        _instances: &[Vec<(String, Value)>],
+    ) -> Vec<Vec<(String, Value)>> {
+        Vec::new()
+    }
 
-    /// The curve an object value stands for.
-    fn curve(&self, object: &Value) -> Option<PlanarCurve>;
+    /// Evaluates one call of an application node ([`Eval::Host`]) on node
+    /// `node`, returning its outputs in `spec.outputs` order.
+    fn call(&mut self, _node: NodeId, _spec: &'static Spec, _args: &[Value]) -> Vec<Value> {
+        Vec::new()
+    }
 
     /// Evaluates an arithmetic expression.
-    fn expression(&self, text: &str) -> Option<f64>;
+    fn expression(&self, text: &str) -> Option<f64> {
+        expr::eval(text)
+    }
 }
+
+/// No application: the built-in library only.
+impl Host for () {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Port {
@@ -209,10 +221,14 @@ impl Graph {
         })
     }
 
-    /// Reads [`to_json`](Self::to_json) output. Inputs an operation has
-    /// gained since the file was written start at their defaults; links to
-    /// nodes that are not there are dropped.
-    pub fn from_json(value: &Value) -> Result<Self, String> {
+    /// Reads [`to_json`](Self::to_json) output, finding operations by name
+    /// through `resolve` (e.g. the application's specs, then [`spec`]).
+    /// Inputs an operation has gained since the file was written start at
+    /// their defaults; links to nodes that are not there are dropped.
+    pub fn from_json(
+        value: &Value,
+        resolve: &dyn Fn(&str) -> Option<&'static Spec>,
+    ) -> Result<Self, String> {
         let mut graph = Graph::default();
         for node in value["nodes"].as_array().ok_or("missing nodes")? {
             let id = node["id"]
@@ -221,7 +237,7 @@ impl Graph {
                 .filter(|id| *id > 0 && graph.node(*id).is_none())
                 .ok_or("missing, zero or repeated node id")?;
             let kind = if let Some(name) = node["kind"]["op"].as_str() {
-                Kind::Op(spec(name).ok_or_else(|| format!("unknown node `{name}`"))?)
+                Kind::Op(resolve(name).ok_or_else(|| format!("unknown node `{name}`"))?)
             } else if let Some(name) = node["kind"]["object"].as_str() {
                 Kind::Object(name.to_owned())
             } else {
@@ -266,15 +282,16 @@ impl Graph {
         }
     }
 
-    fn evaluate_op(&self, id: NodeId, spec: &'static Spec, host: &dyn Host) -> BTreeMap<String, Value> {
+    fn evaluate_op(&self, id: NodeId, spec: &'static Spec, host: &mut dyn Host) -> BTreeMap<String, Value> {
         let args: Vec<Value> = spec
             .inputs
             .iter()
             .map(|input| self.input(&Port { node: id, field: input.name.to_owned() }))
             .collect();
         let scalar: Vec<bool> = spec.inputs.iter().map(|input| !input.list).collect();
-        let values = value::lace(&args, &scalar, spec.outputs.len(), &mut |args| {
-            (spec.eval)(args, host)
+        let values = value::lace(&args, &scalar, spec.outputs.len(), &mut |args| match spec.eval {
+            Eval::Pure(eval) => eval(args, &*host),
+            Eval::Host => host.call(id, spec, args),
         });
         spec.outputs
             .iter()
@@ -284,12 +301,21 @@ impl Graph {
     }
 
     fn evaluate_object(&self, id: NodeId, kind: &str, host: &mut dyn Host) -> BTreeMap<String, Value> {
-        let linked: Vec<(String, Value)> = self
+        // Linked fields, then the values set by hand on unlinked ones.
+        let mut linked: Vec<(String, Value)> = self
             .links
             .iter()
             .filter(|link| link.to.node == id)
             .map(|link| (link.to.field.clone(), self.input(&link.to)))
             .collect();
+        if let Some(node) = self.node(id) {
+            linked.extend(
+                node.params
+                    .iter()
+                    .filter(|(field, _)| !self.is_linked(&Port { node: id, field: (*field).clone() }))
+                    .map(|(field, value)| (field.clone(), value.clone())),
+            );
+        }
         // One object per element of the shortest linked list. ponytail: an
         // empty list still keeps one object, since its ports are read from it.
         let count = linked
